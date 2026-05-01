@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.matplotlib/
+
+# Training datasets are not required for the deployed API and can exceed GitHub limits.
+data/*.csv
+
+# Generated reports can be recreated with ml/generate_visualizations.py.
+visualizations/*.png
