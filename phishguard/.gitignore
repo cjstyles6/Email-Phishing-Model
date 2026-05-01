@@ -1,10 +1,19 @@
+# Large data files
+data/combined_emails.csv
+data/cleaned_emails.csv
+
+# Model files (too large for GitHub)
+api/models/xgboost_model.pkl
+api/models/tfidf_vectorizer.pkl
+
+# Python
 __pycache__/
-*.py[cod]
+*.pyc
 .venv/
-.matplotlib/
+*.egg-info/
 
-# Training datasets are not required for the deployed API and can exceed GitHub limits.
-data/*.csv
+# Visualizations (optional, comment out if you want them on GitHub)
+visualizations/
 
-# Generated reports can be recreated with ml/generate_visualizations.py.
-visualizations/*.png
+# Environment
+.env
