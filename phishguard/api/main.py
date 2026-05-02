@@ -7,6 +7,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 try:
+    import gdown
     import joblib
     import uvicorn
     from fastapi import FastAPI, HTTPException, Request
@@ -24,6 +25,9 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "models"
 MODEL_PATH = MODEL_DIR / "xgboost_model.pkl"
 VECTORIZER_PATH = MODEL_DIR / "tfidf_vectorizer.pkl"
+
+VECTORIZER_FILE_ID = "1MfNmLCcmtzGPnoVZRaSGTNo22CFa05j_"
+MODEL_FILE_ID = "1gP2BXkwKBqVkJbmsl-gViPc_Y55dKxsY"
 
 MODEL_INFO = {
     "model_version": "2.0",
@@ -73,15 +77,40 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("phishguard_api")
 
 
+def download_models() -> None:
+    """Download model files from Google Drive if they are not present locally."""
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not VECTORIZER_PATH.exists():
+        logger.info("Vectorizer not found locally. Downloading from Google Drive...")
+        gdown.download(
+            f"https://drive.google.com/uc?id={VECTORIZER_FILE_ID}",
+            str(VECTORIZER_PATH),
+            quiet=False,
+        )
+        logger.info("✅ Vectorizer downloaded successfully")
+    else:
+        logger.info("✅ Vectorizer found locally")
+
+    if not MODEL_PATH.exists():
+        logger.info("Model not found locally. Downloading from Google Drive...")
+        gdown.download(
+            f"https://drive.google.com/uc?id={MODEL_FILE_ID}",
+            str(MODEL_PATH),
+            quiet=False,
+        )
+        logger.info("✅ Model downloaded successfully")
+    else:
+        logger.info("✅ Model found locally")
+
+
 class PredictionRequest(BaseModel):
     """Request body for phishing prediction."""
-
     email_text: str
 
 
 class BatchPredictionRequest(BaseModel):
     """Request body for batch phishing prediction."""
-
     emails: list[str]
 
 
@@ -151,6 +180,9 @@ def format_prediction_result(
     }
 
 
+# Download models before anything else runs
+download_models()
+
 app = FastAPI(title="Email Phishing Detection API")
 model, vectorizer = load_artifacts()
 
@@ -200,10 +232,8 @@ def model_info() -> dict[str, float | int | str]:
 def predict_email(request: PredictionRequest) -> dict[str, float | str | list[str]]:
     """Predict whether an email is phishing and return supporting metadata."""
     email_features = vectorizer.transform([request.email_text])
-
     predicted_label = int(model.predict(email_features)[0])
     probabilities = model.predict_proba(email_features)[0]
-
     return format_prediction_result(request.email_text, predicted_label, probabilities)
 
 
