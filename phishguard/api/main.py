@@ -72,6 +72,7 @@ IMPERSONATION_TRIGGERS = (
     "bank of",
 )
 MAX_BATCH_SIZE = 50
+PHISHING_THRESHOLD = 0.75
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("phishguard_api")
@@ -164,11 +165,11 @@ def build_flags(email_text: str, phishing_probability: float) -> list[str]:
 
 def format_prediction_result(
     email_text: str,
-    predicted_label: int,
     probabilities,
 ) -> dict[str, float | str | list[str]]:
     """Format model output into the public API response shape."""
     phishing_probability = float(probabilities[1])
+    predicted_label = 1 if phishing_probability >= PHISHING_THRESHOLD else 0
     predicted_confidence = float(probabilities[predicted_label]) * 100
     prediction = "Phishing Email" if predicted_label == 1 else "Safe Email"
 
@@ -224,6 +225,7 @@ def model_info() -> dict[str, float | int | str]:
     """Return metadata for the currently deployed phishing model."""
     return {
         **MODEL_INFO,
+        "classification_threshold": PHISHING_THRESHOLD,
         "last_updated": date.today().isoformat(),
     }
 
@@ -232,9 +234,8 @@ def model_info() -> dict[str, float | int | str]:
 def predict_email(request: PredictionRequest) -> dict[str, float | str | list[str]]:
     """Predict whether an email is phishing and return supporting metadata."""
     email_features = vectorizer.transform([request.email_text])
-    predicted_label = int(model.predict(email_features)[0])
     probabilities = model.predict_proba(email_features)[0]
-    return format_prediction_result(request.email_text, predicted_label, probabilities)
+    return format_prediction_result(request.email_text, probabilities)
 
 
 @app.post("/predict-batch")
@@ -255,7 +256,6 @@ def predict_batch(
 
     started_at = time.perf_counter()
     email_features = vectorizer.transform(request.emails)
-    predicted_labels = model.predict(email_features)
     probabilities = model.predict_proba(email_features)
     processing_time_ms = (time.perf_counter() - started_at) * 1000
 
@@ -264,12 +264,11 @@ def predict_batch(
             "email_index": index,
             **format_prediction_result(
                 email_text,
-                int(predicted_label),
                 email_probabilities,
             ),
         }
-        for index, (email_text, predicted_label, email_probabilities) in enumerate(
-            zip(request.emails, predicted_labels, probabilities)
+        for index, (email_text, email_probabilities) in enumerate(
+            zip(request.emails, probabilities)
         )
     ]
 
