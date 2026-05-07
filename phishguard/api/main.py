@@ -2,9 +2,14 @@
 
 import logging
 import os
+import re
 import time
 from datetime import date, datetime
+from email.parser import Parser
+from email.policy import default
+from email.utils import parseaddr
 from pathlib import Path
+from typing import Any
 
 try:
     import gdown
@@ -73,6 +78,13 @@ IMPERSONATION_TRIGGERS = (
 )
 MAX_BATCH_SIZE = 50
 PHISHING_THRESHOLD = 0.75
+HEADER_SECURITY_CHECK_COUNT = 8
+FREE_EMAIL_PROVIDERS = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com"}
+SUSPICIOUS_X_MAILER_PATTERNS = ("the bat", "massive", "bulk")
+DOMAIN_PATTERN = re.compile(
+    r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b",
+    re.IGNORECASE,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("phishguard_api")
@@ -113,6 +125,23 @@ class PredictionRequest(BaseModel):
 class BatchPredictionRequest(BaseModel):
     """Request body for batch phishing prediction."""
     emails: list[str]
+
+
+class GmailHeader(BaseModel):
+    """Single Gmail API header item."""
+    name: str
+    value: str
+
+
+class HeaderAnalysisRequest(BaseModel):
+    """Request body for email header analysis."""
+    raw_headers: str | None = None
+    gmail_headers: list[GmailHeader] | None = None
+
+
+class FullAnalysisRequest(HeaderAnalysisRequest):
+    """Request body for combined ML and header analysis."""
+    email_text: str
 
 
 def load_artifacts() -> tuple:
@@ -181,6 +210,270 @@ def format_prediction_result(
     }
 
 
+def normalize_domain(domain: str | None) -> str | None:
+    """Normalize a domain for safe comparison."""
+    if not domain:
+        return None
+    normalized = domain.lower().strip().strip("<>[]()'\".,;:")
+    if normalized.startswith("www."):
+        normalized = normalized[4:]
+    return normalized or None
+
+
+def extract_email_domain(header_value: str | None) -> str | None:
+    """Extract the domain from an email header value."""
+    if not header_value:
+        return None
+
+    _, email_address = parseaddr(header_value)
+    if "@" not in email_address:
+        return None
+
+    return normalize_domain(email_address.rsplit("@", 1)[1])
+
+
+def extract_display_name_domain(header_value: str | None) -> str | None:
+    """Find a domain-like token in the From display name, if one exists."""
+    if not header_value:
+        return None
+
+    display_name, email_address = parseaddr(header_value)
+    actual_domain = extract_email_domain(email_address)
+    for match in DOMAIN_PATTERN.findall(display_name):
+        candidate = normalize_domain(match)
+        if candidate and candidate != actual_domain:
+            return candidate
+    return None
+
+
+def add_header_value(
+    normalized_headers: dict[str, list[str]],
+    header_name: str | None,
+    header_value: str | None,
+) -> None:
+    """Add a header value to the case-insensitive normalized header map."""
+    if not header_name:
+        return
+
+    name = header_name.strip().lower()
+    value = (header_value or "").strip()
+    if not name:
+        return
+
+    normalized_headers.setdefault(name, []).append(value)
+
+
+def parse_header_sources(
+    raw_headers: str | None,
+    gmail_headers: list[GmailHeader] | None,
+) -> dict[str, list[str]]:
+    """Parse raw or Gmail API headers into a case-insensitive multi-map."""
+    normalized_headers: dict[str, list[str]] = {}
+
+    if raw_headers and raw_headers.strip():
+        parsed_headers = Parser(policy=default).parsestr(raw_headers)
+        for name, value in parsed_headers.items():
+            add_header_value(normalized_headers, name, value)
+
+    if gmail_headers:
+        for header in gmail_headers:
+            add_header_value(normalized_headers, header.name, header.value)
+
+    return normalized_headers
+
+
+def first_header(
+    headers: dict[str, list[str]],
+    name: str,
+    *,
+    contains: str | None = None,
+) -> str | None:
+    """Return the first matching header value, optionally filtered by text."""
+    values = headers.get(name.lower(), [])
+    if contains is None:
+        return values[0] if values else None
+
+    needle = contains.lower()
+    for value in values:
+        if needle in value.lower():
+            return value
+    return None
+
+
+def extract_header_fields(headers: dict[str, list[str]]) -> dict[str, str | bool | None]:
+    """Extract security-relevant email header fields."""
+    authentication_results = first_header(
+        headers,
+        "authentication-results",
+        contains="dmarc",
+    )
+
+    return {
+        "from_address": first_header(headers, "from"),
+        "reply_to": first_header(headers, "reply-to"),
+        "return_path": first_header(headers, "return-path"),
+        "received_spf": first_header(headers, "received-spf"),
+        "dkim_signature": bool(headers.get("dkim-signature")),
+        "dmarc": authentication_results
+        or first_header(headers, "dmarc-filter")
+        or first_header(headers, "x-dmarc-status"),
+        "x_mailer": first_header(headers, "x-mailer"),
+        "message_id": first_header(headers, "message-id"),
+        "subject": first_header(headers, "subject"),
+        "date": first_header(headers, "date"),
+    }
+
+
+def build_header_flags(extracted_headers: dict[str, str | bool | None]) -> list[str]:
+    """Run phishing-oriented security checks against extracted headers."""
+    flags: list[str] = []
+    from_value = extracted_headers["from_address"]
+    from_domain = extract_email_domain(from_value if isinstance(from_value, str) else None)
+
+    reply_to_domain = extract_email_domain(
+        extracted_headers["reply_to"]
+        if isinstance(extracted_headers["reply_to"], str)
+        else None
+    )
+    if from_domain and reply_to_domain and reply_to_domain != from_domain:
+        flags.append("reply_to_mismatch")
+
+    return_path_domain = extract_email_domain(
+        extracted_headers["return_path"]
+        if isinstance(extracted_headers["return_path"], str)
+        else None
+    )
+    if from_domain and return_path_domain and return_path_domain != from_domain:
+        flags.append("return_path_mismatch")
+
+    received_spf = extracted_headers["received_spf"]
+    if isinstance(received_spf, str) and (
+        "softfail" in received_spf.lower() or "fail" in received_spf.lower()
+    ):
+        flags.append("spf_fail")
+
+    if not extracted_headers["dkim_signature"]:
+        flags.append("no_dkim")
+
+    if from_domain in FREE_EMAIL_PROVIDERS:
+        flags.append("free_email_provider")
+
+    x_mailer = extracted_headers["x_mailer"]
+    if isinstance(x_mailer, str) and any(
+        pattern in x_mailer.lower() for pattern in SUSPICIOUS_X_MAILER_PATTERNS
+    ):
+        flags.append("suspicious_x_mailer")
+
+    if not extracted_headers["message_id"]:
+        flags.append("no_message_id")
+
+    display_domain = extract_display_name_domain(
+        from_value if isinstance(from_value, str) else None
+    )
+    if from_domain and display_domain and display_domain != from_domain:
+        flags.append("domain_mismatch")
+
+    return flags
+
+
+def threat_level_from_score(score: float) -> str:
+    """Map a normalized threat score to a user-facing risk level."""
+    if score < 0.3:
+        return "safe"
+    if score < 0.6:
+        return "suspicious"
+    return "danger"
+
+
+def build_header_recommendation(flags: list[str], threat_level: str) -> str:
+    """Create a concise English recommendation for the header analysis result."""
+    if not flags:
+        return (
+            "No major header anomalies were detected. Continue to review links, "
+            "attachments, and message content before trusting the email."
+        )
+
+    if threat_level == "danger":
+        return (
+            "Multiple header authentication or identity anomalies were detected. "
+            "Treat this email as high risk, avoid clicking links or opening attachments, "
+            "and verify the sender through a trusted channel."
+        )
+
+    if "spf_fail" in flags or "no_dkim" in flags:
+        return (
+            "The message shows authentication weaknesses. Verify the sender before "
+            "responding, opening attachments, or following any requested action."
+        )
+
+    return (
+        "Some sender identity signals look unusual. Use caution and confirm the "
+        "message through an independent trusted contact path."
+    )
+
+
+def analyze_header_payload(
+    raw_headers: str | None,
+    gmail_headers: list[GmailHeader] | None,
+) -> dict[str, Any]:
+    """Analyze email headers and return extracted fields, flags, and risk score."""
+    has_raw_headers = bool(raw_headers and raw_headers.strip())
+    has_gmail_headers = bool(gmail_headers)
+    if not has_raw_headers and not has_gmail_headers:
+        raise HTTPException(
+            status_code=400,
+            detail="raw_headers or gmail_headers must be provided",
+        )
+
+    headers = parse_header_sources(raw_headers, gmail_headers)
+    extracted_headers = extract_header_fields(headers)
+    flags = build_header_flags(extracted_headers)
+    header_threat_score = round(len(flags) / HEADER_SECURITY_CHECK_COUNT, 4)
+    threat_level = threat_level_from_score(header_threat_score)
+
+    return {
+        "extracted_headers": extracted_headers,
+        "flags": flags,
+        "header_threat_score": header_threat_score,
+        "threat_level": threat_level,
+        "recommendation": build_header_recommendation(flags, threat_level),
+    }
+
+
+def predict_email_text(email_text: str) -> dict[str, float | str | list[str]]:
+    """Run the ML phishing model for a single email body."""
+    email_features = vectorizer.transform([email_text])
+    probabilities = model.predict_proba(email_features)[0]
+    return format_prediction_result(email_text, probabilities)
+
+
+def build_full_analysis_recommendation(
+    ml_analysis: dict[str, Any],
+    header_analysis: dict[str, Any],
+    final_verdict: str,
+) -> str:
+    """Summarize the combined ML and header-analysis result."""
+    if final_verdict == "danger":
+        return (
+            "The combined content and header signals indicate high phishing risk. "
+            "Do not interact with the email until it has been verified independently."
+        )
+
+    if final_verdict == "suspicious":
+        return (
+            "The email has enough suspicious indicators to warrant caution. Review "
+            "the ML flags and header flags, then verify the sender before acting."
+        )
+
+    if ml_analysis.get("flags") or header_analysis.get("flags"):
+        return (
+            "The overall score is low, but one or more cautionary signals were found. "
+            "Review the highlighted flags before trusting the message."
+        )
+
+    return "The email appears low risk based on both content and header checks."
+
+
 # Download models before anything else runs
 download_models()
 
@@ -233,9 +526,37 @@ def model_info() -> dict[str, float | int | str]:
 @app.post("/predict")
 def predict_email(request: PredictionRequest) -> dict[str, float | str | list[str]]:
     """Predict whether an email is phishing and return supporting metadata."""
-    email_features = vectorizer.transform([request.email_text])
-    probabilities = model.predict_proba(email_features)[0]
-    return format_prediction_result(request.email_text, probabilities)
+    return predict_email_text(request.email_text)
+
+
+@app.post("/analyze-headers")
+def analyze_headers(request: HeaderAnalysisRequest) -> dict[str, Any]:
+    """Analyze email authentication and routing headers for phishing signals."""
+    return analyze_header_payload(request.raw_headers, request.gmail_headers)
+
+
+@app.post("/full-analysis")
+def full_analysis(request: FullAnalysisRequest) -> dict[str, Any]:
+    """Run both ML content classification and email header forensics."""
+    ml_analysis = predict_email_text(request.email_text)
+    header_analysis = analyze_header_payload(request.raw_headers, request.gmail_headers)
+
+    ml_score = float(ml_analysis["phishing_probability"])
+    header_score = float(header_analysis["header_threat_score"])
+    combined_threat_score = round((ml_score * 0.7) + (header_score * 0.3), 4)
+    final_verdict = threat_level_from_score(combined_threat_score)
+
+    return {
+        "ml_analysis": ml_analysis,
+        "header_analysis": header_analysis,
+        "combined_threat_score": combined_threat_score,
+        "final_verdict": final_verdict,
+        "recommendation": build_full_analysis_recommendation(
+            ml_analysis,
+            header_analysis,
+            final_verdict,
+        ),
+    }
 
 
 @app.post("/predict-batch")
