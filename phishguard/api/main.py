@@ -25,6 +25,11 @@ except ModuleNotFoundError as exc:
         "  pip install -r requirements.txt"
     ) from exc
 
+try:
+    from .url_checker import URLChecker
+except ImportError:
+    from url_checker import URLChecker
+
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "models"
@@ -33,6 +38,7 @@ VECTORIZER_PATH = MODEL_DIR / "tfidf_vectorizer.pkl"
 
 VECTORIZER_FILE_ID = "1MfNmLCcmtzGPnoVZRaSGTNo22CFa05j_"
 MODEL_FILE_ID = "1gP2BXkwKBqVkJbmsl-gViPc_Y55dKxsY"
+VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY")
 
 MODEL_INFO = {
     "model_version": "2.0",
@@ -450,22 +456,28 @@ def predict_email_text(email_text: str) -> dict[str, float | str | list[str]]:
 def build_full_analysis_recommendation(
     ml_analysis: dict[str, Any],
     header_analysis: dict[str, Any],
+    url_analysis: dict[str, Any],
     final_verdict: str,
 ) -> str:
     """Summarize the combined ML and header-analysis result."""
     if final_verdict == "danger":
         return (
-            "The combined content and header signals indicate high phishing risk. "
+            "The combined content, header, and URL signals indicate high phishing risk. "
             "Do not interact with the email until it has been verified independently."
         )
 
     if final_verdict == "suspicious":
         return (
             "The email has enough suspicious indicators to warrant caution. Review "
-            "the ML flags and header flags, then verify the sender before acting."
+            "the ML, header, and URL findings, then verify the sender before acting."
         )
 
-    if ml_analysis.get("flags") or header_analysis.get("flags"):
+    if (
+        ml_analysis.get("flags")
+        or header_analysis.get("flags")
+        or url_analysis.get("suspicious_count", 0)
+        or url_analysis.get("shortener_count", 0)
+    ):
         return (
             "The overall score is low, but one or more cautionary signals were found. "
             "Review the highlighted flags before trusting the message."
@@ -479,6 +491,7 @@ download_models()
 
 app = FastAPI(title="Email Phishing Detection API")
 model, vectorizer = load_artifacts()
+url_checker = URLChecker(api_key=VIRUSTOTAL_API_KEY)
 
 app.add_middleware(
     CORSMiddleware,
@@ -514,12 +527,13 @@ def health_check() -> dict[str, str]:
 
 
 @app.get("/model-info")
-def model_info() -> dict[str, float | int | str]:
+def model_info() -> dict[str, float | int | str | bool]:
     """Return metadata for the currently deployed phishing model."""
     return {
         **MODEL_INFO,
         "classification_threshold": PHISHING_THRESHOLD,
         "last_updated": date.today().isoformat(),
+        "virustotal_enabled": bool(VIRUSTOTAL_API_KEY),
     }
 
 
@@ -535,25 +549,38 @@ def analyze_headers(request: HeaderAnalysisRequest) -> dict[str, Any]:
     return analyze_header_payload(request.raw_headers, request.gmail_headers)
 
 
+@app.post("/check-urls")
+def check_urls(request: PredictionRequest) -> dict[str, Any]:
+    """Extract URLs from email text and check local and reputation signals."""
+    return url_checker.check_email_text(request.email_text)
+
+
 @app.post("/full-analysis")
 def full_analysis(request: FullAnalysisRequest) -> dict[str, Any]:
-    """Run both ML content classification and email header forensics."""
+    """Run ML content classification, header forensics, and URL reputation checks."""
     ml_analysis = predict_email_text(request.email_text)
     header_analysis = analyze_header_payload(request.raw_headers, request.gmail_headers)
+    url_analysis = url_checker.check_email_text(request.email_text)
 
     ml_score = float(ml_analysis["phishing_probability"])
     header_score = float(header_analysis["header_threat_score"])
-    combined_threat_score = round((ml_score * 0.7) + (header_score * 0.3), 4)
+    url_score = float(url_analysis["url_threat_score"])
+    combined_threat_score = round(
+        (ml_score * 0.6) + (header_score * 0.2) + (url_score * 0.2),
+        4,
+    )
     final_verdict = threat_level_from_score(combined_threat_score)
 
     return {
         "ml_analysis": ml_analysis,
         "header_analysis": header_analysis,
+        "url_analysis": url_analysis,
         "combined_threat_score": combined_threat_score,
         "final_verdict": final_verdict,
         "recommendation": build_full_analysis_recommendation(
             ml_analysis,
             header_analysis,
+            url_analysis,
             final_verdict,
         ),
     }
