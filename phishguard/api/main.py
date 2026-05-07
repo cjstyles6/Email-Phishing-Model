@@ -11,9 +11,13 @@ from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/phishguard_matplotlib")
+
 try:
     import gdown
     import joblib
+    import numpy as np
+    import shap
     import uvicorn
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
@@ -27,8 +31,10 @@ except ModuleNotFoundError as exc:
 
 try:
     from .url_checker import URLChecker
+    from .threat_intelligence import ThreatIntelligence
 except ImportError:
     from url_checker import URLChecker
+    from threat_intelligence import ThreatIntelligence
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -39,6 +45,7 @@ VECTORIZER_PATH = MODEL_DIR / "tfidf_vectorizer.pkl"
 VECTORIZER_FILE_ID = "1MfNmLCcmtzGPnoVZRaSGTNo22CFa05j_"
 MODEL_FILE_ID = "1gP2BXkwKBqVkJbmsl-gViPc_Y55dKxsY"
 VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY")
+ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY")
 
 MODEL_INFO = {
     "model_version": "2.0",
@@ -201,18 +208,104 @@ def build_flags(email_text: str, phishing_probability: float) -> list[str]:
 def format_prediction_result(
     email_text: str,
     probabilities,
-) -> dict[str, float | str | list[str]]:
+    *,
+    include_shap: bool = True,
+) -> dict[str, Any]:
     """Format model output into the public API response shape."""
     phishing_probability = float(probabilities[1])
     predicted_label = 1 if phishing_probability >= PHISHING_THRESHOLD else 0
     predicted_confidence = float(probabilities[predicted_label]) * 100
     prediction = "Phishing Email" if predicted_label == 1 else "Safe Email"
 
-    return {
+    result = {
         "prediction": prediction,
         "confidence": round(predicted_confidence, 2),
         "phishing_probability": round(phishing_probability, 4),
         "flags": build_flags(email_text, phishing_probability),
+    }
+    if include_shap:
+        result["shap_explanation"] = get_shap_explanation(email_text)
+    return result
+
+
+def normalize_shap_values(raw_values: Any) -> np.ndarray:
+    """Normalize SHAP outputs across binary XGBoost/SHAP variants."""
+    if isinstance(raw_values, list):
+        raw_values = raw_values[-1]
+    values = np.asarray(raw_values)
+    if values.ndim == 3:
+        values = values[:, :, -1]
+    if values.ndim == 2:
+        return values[0]
+    return values
+
+
+def normalize_shap_base_value(explainer: Any) -> float:
+    """Return a scalar expected value for binary classification explanations."""
+    expected_value = explainer.expected_value
+    if isinstance(expected_value, list):
+        return float(expected_value[-1])
+
+    values = np.asarray(expected_value)
+    if values.ndim == 0:
+        return float(values)
+    return float(values.ravel()[-1])
+
+
+def get_shap_explanation(email_text: str) -> dict[str, Any]:
+    """Explain one prediction with top positive and negative SHAP word impacts."""
+    email_features = vectorizer.transform([email_text])
+    raw_values = shap_explainer.shap_values(email_features)
+    shap_values = normalize_shap_values(raw_values)
+    feature_values = email_features.toarray()[0]
+    feature_names = vectorizer.get_feature_names_out()
+    present_indices = np.flatnonzero(feature_values > 0)
+    candidate_indices = present_indices if len(present_indices) else np.arange(len(shap_values))
+
+    positive_indices = sorted(
+        (index for index in candidate_indices if shap_values[index] > 0),
+        key=lambda index: shap_values[index],
+        reverse=True,
+    )[:10]
+    negative_indices = sorted(
+        (index for index in candidate_indices if shap_values[index] < 0),
+        key=lambda index: shap_values[index],
+    )[:10]
+
+    top_phishing_words = [
+        {
+            "word": str(feature_names[index]),
+            "shap_value": round(float(shap_values[index]), 6),
+        }
+        for index in positive_indices
+    ]
+    top_safe_words = [
+        {
+            "word": str(feature_names[index]),
+            "shap_value": round(float(shap_values[index]), 6),
+        }
+        for index in negative_indices
+    ]
+
+    phishing_terms = "', '".join(item["word"] for item in top_phishing_words[:3])
+    safe_terms = "', '".join(item["word"] for item in top_safe_words[:3])
+    if phishing_terms and safe_terms:
+        explanation = (
+            f"The words '{phishing_terms}' strongly indicated phishing while "
+            f"'{safe_terms}' suggested legitimate email."
+        )
+    elif phishing_terms:
+        explanation = f"The words '{phishing_terms}' strongly indicated phishing."
+    elif safe_terms:
+        explanation = f"The words '{safe_terms}' suggested legitimate email."
+    else:
+        explanation = "No high-impact words were isolated for this prediction."
+
+    return {
+        "top_phishing_words": top_phishing_words,
+        "top_safe_words": top_safe_words,
+        "base_value": round(normalize_shap_base_value(shap_explainer), 6),
+        "prediction_explanation": explanation,
     }
 
 
@@ -446,30 +539,31 @@ def analyze_header_payload(
     }
 
 
-def predict_email_text(email_text: str) -> dict[str, float | str | list[str]]:
+def predict_email_text(email_text: str, *, include_shap: bool = True) -> dict[str, Any]:
     """Run the ML phishing model for a single email body."""
     email_features = vectorizer.transform([email_text])
     probabilities = model.predict_proba(email_features)[0]
-    return format_prediction_result(email_text, probabilities)
+    return format_prediction_result(email_text, probabilities, include_shap=include_shap)
 
 
 def build_full_analysis_recommendation(
     ml_analysis: dict[str, Any],
     header_analysis: dict[str, Any],
     url_analysis: dict[str, Any],
+    threat_intelligence: dict[str, Any],
     final_verdict: str,
 ) -> str:
     """Summarize the combined ML and header-analysis result."""
     if final_verdict == "danger":
         return (
-            "The combined content, header, and URL signals indicate high phishing risk. "
+            "The combined content, header, URL, and threat intelligence signals indicate high phishing risk. "
             "Do not interact with the email until it has been verified independently."
         )
 
     if final_verdict == "suspicious":
         return (
             "The email has enough suspicious indicators to warrant caution. Review "
-            "the ML, header, and URL findings, then verify the sender before acting."
+            "the ML, header, URL, and threat intelligence findings, then verify the sender before acting."
         )
 
     if (
@@ -477,6 +571,7 @@ def build_full_analysis_recommendation(
         or header_analysis.get("flags")
         or url_analysis.get("suspicious_count", 0)
         or url_analysis.get("shortener_count", 0)
+        or threat_intelligence.get("flags")
     ):
         return (
             "The overall score is low, but one or more cautionary signals were found. "
@@ -491,7 +586,9 @@ download_models()
 
 app = FastAPI(title="Email Phishing Detection API")
 model, vectorizer = load_artifacts()
+shap_explainer = shap.TreeExplainer(model)
 url_checker = URLChecker(api_key=VIRUSTOTAL_API_KEY)
+threat_intelligence = ThreatIntelligence(abuseipdb_api_key=ABUSEIPDB_API_KEY)
 
 app.add_middleware(
     CORSMiddleware,
@@ -534,13 +631,21 @@ def model_info() -> dict[str, float | int | str | bool]:
         "classification_threshold": PHISHING_THRESHOLD,
         "last_updated": date.today().isoformat(),
         "virustotal_enabled": bool(VIRUSTOTAL_API_KEY),
+        "abuseipdb_enabled": bool(ABUSEIPDB_API_KEY),
+        "whois_enabled": True,
     }
 
 
 @app.post("/predict")
-def predict_email(request: PredictionRequest) -> dict[str, float | str | list[str]]:
+def predict_email(request: PredictionRequest) -> dict[str, Any]:
     """Predict whether an email is phishing and return supporting metadata."""
     return predict_email_text(request.email_text)
+
+
+@app.post("/explain")
+def explain_prediction(request: PredictionRequest) -> dict[str, Any]:
+    """Return only SHAP explanation details for a single email body."""
+    return get_shap_explanation(request.email_text)
 
 
 @app.post("/analyze-headers")
@@ -555,18 +660,43 @@ def check_urls(request: PredictionRequest) -> dict[str, Any]:
     return url_checker.check_email_text(request.email_text)
 
 
+@app.post("/threat-intelligence")
+async def analyze_threat_intelligence(request: HeaderAnalysisRequest) -> dict[str, Any]:
+    """Analyze sender IP reputation and sender domain age intelligence."""
+    has_raw_headers = bool(request.raw_headers and request.raw_headers.strip())
+    has_gmail_headers = bool(request.gmail_headers)
+    if not has_raw_headers and not has_gmail_headers:
+        raise HTTPException(
+            status_code=400,
+            detail="raw_headers or gmail_headers must be provided",
+        )
+
+    return await threat_intelligence.analyze(
+        raw_headers=request.raw_headers,
+        gmail_headers=request.gmail_headers,
+    )
+
+
 @app.post("/full-analysis")
-def full_analysis(request: FullAnalysisRequest) -> dict[str, Any]:
+async def full_analysis(request: FullAnalysisRequest) -> dict[str, Any]:
     """Run ML content classification, header forensics, and URL reputation checks."""
     ml_analysis = predict_email_text(request.email_text)
     header_analysis = analyze_header_payload(request.raw_headers, request.gmail_headers)
     url_analysis = url_checker.check_email_text(request.email_text)
+    threat_intel_analysis = await threat_intelligence.analyze(
+        raw_headers=request.raw_headers,
+        gmail_headers=request.gmail_headers,
+    )
 
     ml_score = float(ml_analysis["phishing_probability"])
     header_score = float(header_analysis["header_threat_score"])
     url_score = float(url_analysis["url_threat_score"])
+    threat_intel_score = float(threat_intel_analysis["threat_intelligence_score"])
     combined_threat_score = round(
-        (ml_score * 0.6) + (header_score * 0.2) + (url_score * 0.2),
+        (ml_score * 0.5)
+        + (header_score * 0.15)
+        + (url_score * 0.15)
+        + (threat_intel_score * 0.2),
         4,
     )
     final_verdict = threat_level_from_score(combined_threat_score)
@@ -575,12 +705,14 @@ def full_analysis(request: FullAnalysisRequest) -> dict[str, Any]:
         "ml_analysis": ml_analysis,
         "header_analysis": header_analysis,
         "url_analysis": url_analysis,
+        "threat_intelligence": threat_intel_analysis,
         "combined_threat_score": combined_threat_score,
         "final_verdict": final_verdict,
         "recommendation": build_full_analysis_recommendation(
             ml_analysis,
             header_analysis,
             url_analysis,
+            threat_intel_analysis,
             final_verdict,
         ),
     }
@@ -613,6 +745,7 @@ def predict_batch(
             **format_prediction_result(
                 email_text,
                 email_probabilities,
+                include_shap=False,
             ),
         }
         for index, (email_text, email_probabilities) in enumerate(
